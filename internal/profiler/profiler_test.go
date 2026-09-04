@@ -16,26 +16,53 @@ import (
 func TestNormalizeGoCommand(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]struct {
-		in   []string
-		want []string
-	}{
-		"bare subcommand gets go":  {[]string{"build", "./..."}, []string{"go", "build", "./..."}},
-		"explicit go is kept":      {[]string{"go", "run", "."}, []string{"go", "run", "."}},
-		"absolute go is kept":      {[]string{"/usr/local/go/bin/go", "test"}, []string{"/usr/local/go/bin/go", "test"}},
-		"unknown command untouche": {[]string{"make", "server"}, []string{"make", "server"}},
-	}
+	t.Run("accepted", func(t *testing.T) {
+		t.Parallel()
 
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+		cases := map[string]struct {
+			in   []string
+			want []string
+		}{
+			"a bare subcommand gets go":      {[]string{"build", "./..."}, []string{"go", "build", "./..."}},
+			"explicit go is kept":            {[]string{"go", "run", "."}, []string{"go", "run", "."}},
+			"a path to go is kept":           {[]string{"/opt/go1.25/bin/go", "test"}, []string{"/opt/go1.25/bin/go", "test"}},
+			"a versioned wrapper is kept":    {[]string{"go1.24.3", "build", "."}, []string{"go1.24.3", "build", "."}},
+			"a path to a wrapper is kept":    {[]string{"/Users/x/go/bin/go1.24.3", "build"}, []string{"/Users/x/go/bin/go1.24.3", "build"}},
+			"go.exe is kept":                 {[]string{"go.exe", "build"}, []string{"go.exe", "build"}},
+			"a subcommand we cannot profile": {[]string{"mod", "tidy"}, []string{"go", "mod", "tidy"}},
+		}
 
-			got := normalizeGoCommand(tc.in)
-			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
-				t.Fatalf("got %v, want %v", got, tc.want)
+		for name, tc := range cases {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				got, err := normalizeGoCommand(tc.in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	// Running something unprofiled with no screen and no explanation is the
+	// most confusing thing this could do, so it refuses instead.
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+
+		for _, argv := range [][]string{
+			{"make", "server"},
+			{"gofmt", "-l", "."},
+			{"golangci-lint", "run"},
+			{},
+		} {
+			if _, err := normalizeGoCommand(argv); err == nil {
+				t.Fatalf("%v should have been refused", argv)
 			}
-		})
-	}
+		}
+	})
 }
 
 func TestInjectToolexec(t *testing.T) {
@@ -845,5 +872,406 @@ func TestFmtDur(t *testing.T) {
 		if got := fmtDur(in); got != want {
 			t.Fatalf("fmtDur(%v) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The allocation rate is not reported by the runtime; it comes from the gap
+// between what one collection left alive and what the next one found.
+func TestAllocationRateFromGCTraces(t *testing.T) {
+	t.Parallel()
+
+	st := newMonitorState("app")
+
+	st.mu.Lock()
+	st.recordGCLocked(gcEvent{num: 1, at: time.Second, heapPrev: 4, heapLive: 2})
+	st.recordGCLocked(gcEvent{num: 2, at: 3 * time.Second, heapPrev: 22, heapLive: 3})
+	st.mu.Unlock()
+
+	// 22 MB found minus 2 MB left alive, over two seconds.
+	if got := st.snapshot().alloc.last; got != 10 {
+		t.Fatalf("alloc rate = %v MB/s, want 10", got)
+	}
+}
+
+// The live cpu figure has to come from a delta; ps only knows the lifetime
+// average, which would be wrong for anything but a busy loop.
+func TestCPUPercentFromDelta(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now()
+	prev := procSample{cpuTime: 2 * time.Second, at: base, ok: true}
+	next := procSample{cpuTime: 3 * time.Second, at: base.Add(2 * time.Second), ok: true}
+
+	pct, ok := next.cpuPercentSince(prev)
+	if !ok || pct < 49 || pct > 51 {
+		t.Fatalf("pct=%v ok=%v, want ~50", pct, ok)
+	}
+
+	if _, ok := next.cpuPercentSince(procSample{}); ok {
+		t.Fatal("a missing previous sample must not produce a number")
+	}
+}
+
+// The critical path is the chain that could not have been shortened by adding
+// machines, so it must follow dependencies rather than raw durations.
+func TestCriticalPathFollowsDependencies(t *testing.T) {
+	t.Parallel()
+
+	graph := `[
+	 {"ID":1,"Mode":"build","Package":"root","Deps":[2,4],"NeedBuild":true,
+	  "TimeReady":"2026-01-01T00:00:03Z","TimeStart":"2026-01-01T00:00:03Z","TimeDone":"2026-01-01T00:00:04Z"},
+	 {"ID":2,"Mode":"build","Package":"slow-chain","Deps":[3],"NeedBuild":true,
+	  "TimeReady":"2026-01-01T00:00:01Z","TimeStart":"2026-01-01T00:00:01Z","TimeDone":"2026-01-01T00:00:03Z"},
+	 {"ID":3,"Mode":"build","Package":"leaf","Deps":[],"NeedBuild":false,
+	  "TimeReady":"2026-01-01T00:00:00Z","TimeStart":"2026-01-01T00:00:00Z","TimeDone":"2026-01-01T00:00:01Z"},
+	 {"ID":4,"Mode":"build","Package":"parallel","Deps":[],"NeedBuild":true,
+	  "TimeReady":"2026-01-01T00:00:00Z","TimeStart":"2026-01-01T00:00:02Z","TimeDone":"2026-01-01T00:00:03Z"}
+	]`
+
+	path := filepath.Join(t.TempDir(), "graph.json")
+	if err := os.WriteFile(path, []byte(graph), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := loadGraph(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if g.built != 3 || g.cached != 1 {
+		t.Fatalf("built=%d cached=%d, want 3/1", g.built, g.cached)
+	}
+
+	// leaf(1s) → slow-chain(2s) → root(1s) is 4s; "parallel" is off the path.
+	if g.critical != 4*time.Second {
+		t.Fatalf("critical=%v, want 4s", g.critical)
+	}
+
+	names := make([]string, 0, len(g.path))
+	for _, l := range g.path {
+		names = append(names, l.pkg)
+	}
+
+	if strings.Join(names, ",") != "root,slow-chain,leaf" {
+		t.Fatalf("path=%v", names)
+	}
+
+	// "parallel" was ready at 0 but only started at 2s: it waited for a worker.
+	if g.queueWait != 2*time.Second {
+		t.Fatalf("queueWait=%v, want 2s", g.queueWait)
+	}
+
+	// A root is a package that rebuilt while all of its dependencies came from
+	// the cache — its own sources changed. Both "slow-chain" (its only
+	// dependency was cached) and "parallel" (it has none) qualify; "root" does
+	// not, it only rebuilt because "slow-chain" did.
+	roots := map[string]int{}
+	for _, r := range g.roots {
+		roots[r.pkg] = r.downstream
+	}
+
+	if len(roots) != 2 || roots["slow-chain"] != 1 || roots["parallel"] != 1 {
+		t.Fatalf("roots=%+v", g.roots)
+	}
+}
+
+func TestGoroutineLeakNoteOnlyForRelentlessGrowth(t *testing.T) {
+	t.Parallel()
+
+	s := newStyles()
+
+	grow := monitorSnap{stacks: []stackGroup{{count: 40, where: "main.worker"}}}
+	for _, n := range []float64{10, 20, 40, 80, 120, 200, 320, 500} {
+		grow.goroutineTrend.push(n)
+	}
+
+	if note := goroutineLeakNote(s, grow); !strings.Contains(stripANSI(note), "main.worker") {
+		t.Fatalf("growth was not reported: %q", stripANSI(note))
+	}
+
+	// A service that opens goroutines per request and closes them is not leaking.
+	var busy monitorSnap
+	for _, n := range []float64{10, 90, 20, 140, 30, 180, 25, 400} {
+		busy.goroutineTrend.push(n)
+	}
+
+	if note := goroutineLeakNote(s, busy); note != "" {
+		t.Fatalf("load mistaken for a leak: %q", stripANSI(note))
+	}
+}
+
+// ps reports cumulative cpu time in whichever shape fits the number.
+func TestParseCPUTime(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]time.Duration{
+		"12.34":      12*time.Second + 340*time.Millisecond,
+		"01:23.45":   83*time.Second + 450*time.Millisecond,
+		"1:02:03":    time.Hour + 2*time.Minute + 3*time.Second,
+		"2-01:00:00": 49 * time.Hour,
+	}
+
+	for in, want := range cases {
+		got, ok := parseCPUTime(in)
+		if !ok || got != want {
+			t.Fatalf("parseCPUTime(%q) = %v (ok=%v), want %v", in, got, ok, want)
+		}
+	}
+
+	if _, ok := parseCPUTime("nonsense"); ok {
+		t.Fatal("expected failure")
+	}
+}
+
+// The live cpu figure has to come from a delta; ps only knows the lifetime
+// average, which would be wrong for anything but a busy loop.
+
+func TestParseCompileBench(t *testing.T) {
+	t.Parallel()
+
+	// Both halves report a subtotal; adding the individual phases as well would
+	// double the time, which is the bug this locks down.
+	const sample = `commit: go1.26.3
+BenchmarkCompile:gopkg.in/yaml.v3:fe:parse         1  222436583 ns/op  27.85 %  11298 lines  50792 lines/s
+BenchmarkCompile:gopkg.in/yaml.v3:fe:escapes       1   20520625 ns/op   2.57 %
+BenchmarkCompile:gopkg.in/yaml.v3:fe:subtotal      1  271388250 ns/op  33.98 %
+BenchmarkCompile:gopkg.in/yaml.v3:be:compilefuncs  1  501222625 ns/op  62.76 %    395 funcs    788 funcs/s
+BenchmarkCompile:gopkg.in/yaml.v3:be:dumpobj       1   26067958 ns/op   3.26 %
+BenchmarkCompile:gopkg.in/yaml.v3:be:subtotal      1  527290583 ns/op  66.02 %
+BenchmarkCompile:gopkg.in/yaml.v3:total            1  798678833 ns/op 100.00 %
+`
+
+	path := filepath.Join(t.TempDir(), "bench.txt")
+	if err := os.WriteFile(path, []byte(sample), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path) //nolint:gosec // path is from t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	got := parseCompileBench(f)
+
+	if got.frontend != 271388250 || got.backend != 527290583 {
+		t.Fatalf("frontend=%v backend=%v", got.frontend, got.backend)
+	}
+	if got.lines != 11298 || got.funcs != 395 {
+		t.Fatalf("lines=%d funcs=%d", got.lines, got.funcs)
+	}
+}
+
+func TestParseGCTrace(t *testing.T) {
+	t.Parallel()
+
+	line := "gc 7 @0.512s 3%: 0.018+0.34+0.003 ms clock, 0.14+0.10/0.31/0.53+0.028 ms cpu, " +
+		"12->13->6 MB, 14 MB goal, 0 MB stacks, 0 MB globals, 8 P"
+
+	ev, ok := parseGCTrace(line)
+	if !ok {
+		t.Fatal("not recognised as a gc trace")
+	}
+
+	if ev.num != 7 || ev.at != 512*time.Millisecond || ev.gcCPU != 3 {
+		t.Fatalf("num=%d at=%v cpu=%v", ev.num, ev.at, ev.gcCPU)
+	}
+	if ev.heapPrev != 12 || ev.heapLive != 6 || ev.goal != 14 {
+		t.Fatalf("heap %v->%v goal %v", ev.heapPrev, ev.heapLive, ev.goal)
+	}
+	// Only the two stop-the-world phases: 0.018 + 0.003 ms.
+	if ev.pause < 20*time.Microsecond || ev.pause > 22*time.Microsecond {
+		t.Fatalf("pause=%v, want the stop-the-world phases only", ev.pause)
+	}
+
+	if _, ok := parseGCTrace("request 12 handled"); ok {
+		t.Fatal("ordinary output must not parse as a gc trace")
+	}
+}
+
+func TestParseGoroutineProfile(t *testing.T) {
+	t.Parallel()
+
+	body := `goroutine profile: total 9
+6 @ 0x104 0x109 0x120
+#	0x103	runtime.gopark+0x11	/go/src/runtime/proc.go:1
+#	0x108	main.leakedWorker+0x1c	/app/main.go:12
+#	0x119	main.main+0x40	/app/main.go:30
+
+2 @ 0x204
+#	0x203	net/http.(*conn).serve+0x8	/go/src/net/http/server.go:1
+
+1 @ 0x304
+#	0x303	runtime.goexit+0x1	/go/src/runtime/asm.s:1
+`
+
+	total, groups := parseGoroutineProfile(body)
+	if total != 9 {
+		t.Fatalf("total=%d, want 9", total)
+	}
+
+	if len(groups) != 3 {
+		t.Fatalf("got %d groups", len(groups))
+	}
+
+	// Largest first, and labelled with the program's own frame rather than the
+	// runtime.gopark every blocked goroutine sits in.
+	if groups[0].count != 6 || groups[0].where != "main.leakedWorker" {
+		t.Fatalf("%+v", groups[0])
+	}
+	if groups[1].where != "net/http.(*conn).serve" {
+		t.Fatalf("%+v", groups[1])
+	}
+	if groups[2].where != "(runtime)" {
+		t.Fatalf("%+v", groups[2])
+	}
+}
+
+// The allocation rate is not reported by the runtime; it comes from the gap
+// between what one collection left alive and what the next one found.
+
+func TestParseInitTrace(t *testing.T) {
+	t.Parallel()
+
+	ev, ok := parseInitTrace("init internal/godebug @0.43 ms, 0.22 ms clock, 2176 bytes, 44 allocs")
+	if !ok {
+		t.Fatal("not recognised as an init trace")
+	}
+
+	if ev.pkg != "internal/godebug" || ev.clock != 220*time.Microsecond ||
+		ev.at != 430*time.Microsecond || ev.bytes != 2176 || ev.allocs != 44 {
+		t.Fatalf("%+v", ev)
+	}
+
+	for _, line := range []string{"initialising things", "init", "hello"} {
+		if _, ok := parseInitTrace(line); ok {
+			t.Fatalf("%q must not parse as an init trace", line)
+		}
+	}
+}
+
+// The wait reason is what tells a leak apart from work, and it may contain
+// brackets of its own.
+
+// The wait reason is what tells a leak apart from work, and it may contain
+// brackets of its own.
+func TestParseSchedGoroutine(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"  G12: status=1(chan receive) m=nil lockedm=nil":    "chan receive",
+		"  G3: status=4(GC worker (idle)) m=nil lockedm=nil": "GC worker (idle)",
+		"  G1: status=2() m=0 lockedm=0":                     "",
+		"G7: status=4(select) m=nil lockedm=nil":             "select",
+	}
+
+	for line, want := range cases {
+		got, ok := parseSchedGoroutine(line)
+		if !ok || got != want {
+			t.Fatalf("%q → %q (ok=%v), want %q", line, got, ok, want)
+		}
+	}
+
+	for _, line := range []string{
+		"  P0: status=1 schedtick=6 runqsize=0",
+		"  M4: p=0 curg=18 mallocing=0",
+		"SCHED 1004ms: gomaxprocs=8",
+		"Good morning",
+	} {
+		if _, ok := parseSchedGoroutine(line); ok {
+			t.Fatalf("%q must not be read as a goroutine line", line)
+		}
+	}
+}
+
+func TestParseSchedTrace(t *testing.T) {
+	t.Parallel()
+
+	line := "SCHED 1004ms: gomaxprocs=8 idleprocs=7 threads=6 spinningthreads=0 idlethreads=3 runqueue=2 [0 1 0]"
+
+	s, ok := parseSchedTrace(line)
+	if !ok || s.procs != 8 || s.threads != 6 || s.idle != 7 || s.runqueue != 2 {
+		t.Fatalf("ok=%v %+v", ok, s)
+	}
+
+	if _, ok := parseSchedTrace("hello world"); ok {
+		t.Fatal("ordinary output must not parse as a sched trace")
+	}
+}
+
+// ps reports cumulative cpu time in whichever shape fits the number.
+
+func TestParseTestLine(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		status testStatus
+		dur    time.Duration
+	}{
+		"ok  \tfnd-app/internal/api\t0.123s":   {testPassed, 123 * time.Millisecond},
+		"ok  \tfnd-app/internal/api\t(cached)": {testCached, 0},
+		"FAIL\tfnd-app/internal/api\t0.456s":   {testFailed, 456 * time.Millisecond},
+		"?   \tfnd-app/cmd\t[no test files]":   {testNoTests, 0},
+	}
+
+	for line, want := range cases {
+		got, ok := parseTestLine(line)
+		if !ok || got.status != want.status || got.dur != want.dur {
+			t.Fatalf("%q → %+v ok=%v, want status %v dur %v", line, got, ok, want.status, want.dur)
+		}
+	}
+
+	for _, line := range []string{"=== RUN   TestFoo", "--- FAIL: TestFoo (0.00s)", "FAIL", ""} {
+		if _, ok := parseTestLine(line); ok {
+			t.Fatalf("%q must not be read as a package verdict", line)
+		}
+	}
+
+	if !isTestFailure("--- FAIL: TestFoo (0.00s)") || isTestFailure("--- PASS: TestFoo (0.00s)") {
+		t.Fatal("failing test functions are not recognised")
+	}
+}
+
+// The critical path is the chain that could not have been shortened by adding
+// machines, so it must follow dependencies rather than raw durations.
+
+func TestSplitRunArgs(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		in    []string
+		flags []string
+		pkg   []string
+		args  []string
+	}{
+		"package then program arguments": {
+			[]string{".", "serve", "--port=8080"},
+			nil, []string{"."}, []string{"serve", "--port=8080"},
+		},
+		"build flag with a separate value": {
+			[]string{"-tags", "dynamic", "./cmd/app", "serve"},
+			[]string{"-tags", "dynamic"}, []string{"./cmd/app"}, []string{"serve"},
+		},
+		"build flag with an inline value": {
+			[]string{"-ldflags=-s -w", ".", "serve"},
+			[]string{"-ldflags=-s -w"}, []string{"."}, []string{"serve"},
+		},
+		"a list of go files": {
+			[]string{"a.go", "b.go", "serve"},
+			nil, []string{"a.go", "b.go"}, []string{"serve"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			flags, pkg, args := splitRunArgs(tc.in)
+			if strings.Join(flags, " ") != strings.Join(tc.flags, " ") ||
+				strings.Join(pkg, " ") != strings.Join(tc.pkg, " ") ||
+				strings.Join(args, " ") != strings.Join(tc.args, " ") {
+				t.Fatalf("flags=%v pkg=%v args=%v", flags, pkg, args)
+			}
+		})
 	}
 }

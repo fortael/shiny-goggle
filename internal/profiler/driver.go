@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +55,27 @@ var toolexecSubcommands = map[string]bool{
 	"list":     true,
 }
 
+// goSubcommands is every subcommand the go command has. It is wider than
+// toolexecSubcommands on purpose: `shiny-goggles mod tidy` has nothing to
+// profile, but it is still a go command and should run rather than be refused.
+var goSubcommands = map[string]bool{
+	"bug": true, "build": true, "clean": true, "doc": true, "env": true,
+	"fix": true, "fmt": true, "generate": true, "get": true, "install": true,
+	"list": true, "mod": true, "run": true, "telemetry": true, "test": true,
+	"tool": true, "version": true, "vet": true, "work": true,
+}
+
+// goBinary matches the name of a go command: "go" itself, the versioned
+// wrappers that `go install golang.org/dl/go1.25.1@latest` produces, and the
+// Windows spelling of either.
+var goBinary = regexp.MustCompile(`^go[0-9.]*(\.exe)?$`)
+
+// isGoCommand looks at the base name, so any path to a go binary is accepted:
+// "go", "/opt/go1.25/bin/go", "./go1.24.3".
+func isGoCommand(arg string) bool {
+	return goBinary.MatchString(filepath.Base(arg))
+}
+
 func runDriver(argv []string) int {
 	opts, rest, err := parseArgs(argv)
 	if err != nil {
@@ -75,7 +97,13 @@ func runDriver(argv []string) int {
 		return 2
 	}
 
-	goArgs := normalizeGoCommand(rest)
+	goArgs, err := normalizeGoCommand(rest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shiny-goggles: %v\n\n", err)
+		usage(os.Stderr)
+
+		return 2
+	}
 
 	self, err := os.Executable()
 	if err != nil {
@@ -423,20 +451,24 @@ func parseArgs(argv []string) (*options, []string, error) {
 
 // normalizeGoCommand lets the user type either the full command or just the go
 // subcommand: `shiny-goggles build ./...` == `shiny-goggles go build ./...`.
-func normalizeGoCommand(rest []string) []string {
+// Anything that is neither is refused rather than run: silently executing a
+// command with no screen attached is the most confusing thing this could do.
+func normalizeGoCommand(rest []string) ([]string, error) {
 	if len(rest) == 0 {
-		return rest
+		return nil, errors.New("nothing to run")
 	}
 
-	if filepath.Base(rest[0]) == "go" {
-		return rest
+	if isGoCommand(rest[0]) {
+		return rest, nil
 	}
 
-	if toolexecSubcommands[rest[0]] {
-		return append([]string{"go"}, rest...)
+	if goSubcommands[rest[0]] {
+		return append([]string{"go"}, rest...), nil
 	}
 
-	return rest
+	return nil, fmt.Errorf("%q is not the go command; shiny-goggles wraps go builds — "+
+		"try `shiny-goggles build ./...`, or give a path: `shiny-goggles /opt/go1.25/bin/go build ./...`",
+		rest[0])
 }
 
 // injectToolexec rewrites `go build ./...` into
@@ -444,7 +476,11 @@ func normalizeGoCommand(rest []string) []string {
 // It reports false when the command cannot be instrumented, in which case it is
 // still returned so the caller can run it untouched.
 func injectToolexec(args []string, self string, opts *options) (cmd []string, sub string, ok bool) {
-	if len(args) < 2 || filepath.Base(args[0]) != "go" || !toolexecSubcommands[args[1]] {
+	if len(args) < 2 || !isGoCommand(args[0]) || !toolexecSubcommands[args[1]] {
+		if len(args) >= 2 {
+			fmt.Fprintf(os.Stderr, "shiny-goggles: nothing to profile in `go %s`, running it as is\n", args[1])
+		}
+
 		return args, "", false
 	}
 

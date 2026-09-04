@@ -78,14 +78,17 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `shiny-goggles — see what the go command is actually doing
 
 usage:
-  shiny-goggles [flags] [--] <go command>
+  shiny-goggles [flags] [--] <go command>          # any path to go works
   shiny-goggles [flags] [--] <subcommand> [args]   # "go" is implied
+
+Anything that is not the go command is refused rather than run unprofiled.
 
 examples:
   shiny-goggles build ./...
   shiny-goggles -verbose test ./internal/...
   shiny-goggles -monitor -pprof=localhost:6060 run . serve
   shiny-goggles -verbose -trace=trace.json build ./...
+  shiny-goggles /opt/go1.25/bin/go build ./...
 
 screens:
   -verbose          slowest packages, what blocked the build, a timeline, and a

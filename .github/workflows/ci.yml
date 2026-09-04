@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # The tool shells out to ps and talks over unix sockets, and the two
+    # platforms disagree about both, so both are worth testing.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: build
+        run: go build -o shiny-goggles ./cmd/shiny-goggles
+
+      # The unit tests never run a real build, so this is the only thing that
+      # proves the toolexec wiring still works end to end. It needs a cache of
+      # its own: against a warm one the go command compiles nothing, and a run
+      # that compiles nothing would pass without the wrapper ever being called.
+      - name: profile a real build
+        run: |
+          GOCACHE=$(mktemp -d) ./shiny-goggles -plain build ./... 2>&1 | tee out.txt
+          grep -Eq "built [0-9]+ packages" out.txt

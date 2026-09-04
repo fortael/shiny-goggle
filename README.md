@@ -10,7 +10,11 @@ starts.
 It needs nothing from the project it profiles: no imports, no code changes, no
 build tags.
 
-<!-- demo animation goes here -->
+![demo.gif](demo.gif)
+
+or
+
+![verbose.gif](verbose.gif)
 
 ## Install
 

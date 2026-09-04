@@ -33,6 +33,7 @@ type options struct {
 	testing     bool // the command under way is `go test`
 	pprof       string
 	clear       bool // erase the verbose screen when the build ends
+	ignore      ignoreList
 	goroutines  bool // count goroutines without pprof, via scheddetail
 	noHistory   bool
 }
@@ -117,7 +118,7 @@ func runInstrumented(full, goArgs []string, sub string, opts *options) int {
 
 	key := commandKey(goArgs)
 	// Writing a trace needs every action, even when the screen would not.
-	st := newStats(hist.expectations(), opts.verbose() || opts.trace != "")
+	st := newStats(hist.expectations(), opts.verbose() || opts.trace != "", opts.ignore)
 
 	// finish() is the single "the build part is over, give the terminal back"
 	// switch. It can be pulled by the linker finishing, by the built program
@@ -251,7 +252,7 @@ func runInstrumented(full, goArgs []string, sub string, opts *options) int {
 	var graph *buildGraph
 
 	if opts.actiongraph != "" {
-		if g, err := loadGraph(opts.actiongraph); err == nil {
+		if g, err := loadGraph(opts.actiongraph, opts.ignore); err == nil {
 			graph = g
 		}
 		if opts.graphTemp {
@@ -365,7 +366,10 @@ func fail(err error) int {
 func parseArgs(argv []string) (*options, []string, error) {
 	opts := &options{mode: ModeSimple}
 
-	var simple, verbose bool
+	var (
+		simple, verbose bool
+		ignore          repeatedFlag
+	)
 
 	fs := flag.NewFlagSet("shiny-goggles", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -377,6 +381,7 @@ func parseArgs(argv []string) (*options, []string, error) {
 	fs.StringVar(&opts.pprof, "pprof", "", "")
 	fs.BoolVar(&opts.goroutines, "goroutines", false, "")
 	fs.BoolVar(&opts.clear, "clear", false, "")
+	fs.Var(&ignore, "ignore", "")
 	fs.IntVar(&opts.top, "top", defaultSlowRows, "")
 	fs.IntVar(&opts.recent, "recent", defaultRecentRows, "")
 	fs.IntVar(&opts.blocking, "blocking", defaultBlockingRows, "")
@@ -399,6 +404,8 @@ func parseArgs(argv []string) (*options, []string, error) {
 	case simple:
 		opts.mode = ModeSimple
 	}
+
+	opts.ignore = parseIgnore(ignore)
 
 	// Erasing the screen only makes sense for the one that takes it over.
 	if opts.clear && opts.mode == ModeSimple {
@@ -501,6 +508,17 @@ func execPassthrough(args []string) int {
 	}
 
 	return 0
+}
+
+// repeatedFlag collects a flag that may be given more than once.
+type repeatedFlag []string
+
+func (f *repeatedFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *repeatedFlag) Set(v string) error {
+	*f = append(*f, v)
+
+	return nil
 }
 
 func terminalWidth() int {

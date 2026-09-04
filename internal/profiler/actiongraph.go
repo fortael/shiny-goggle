@@ -68,7 +68,7 @@ func (g *buildGraph) criticalShare() float64 {
 }
 
 //nolint:gocyclo,funlen // one pass over the graph answering three questions
-func loadGraph(path string) (*buildGraph, error) {
+func loadGraph(path string, ignore ignoreList) (*buildGraph, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // a path we chose ourselves
 	if err != nil {
 		return nil, fmt.Errorf("read action graph: %w", err)
@@ -120,8 +120,8 @@ func loadGraph(path string) (*buildGraph, error) {
 	}
 
 	g.wall = last.Sub(first)
-	g.critical, g.path = criticalPath(actions, byID)
-	g.roots = blastRoots(actions, byID)
+	g.critical, g.path = criticalPath(actions, byID, ignore)
+	g.roots = blastRoots(actions, byID, ignore)
 
 	return g, nil
 }
@@ -129,7 +129,7 @@ func loadGraph(path string) (*buildGraph, error) {
 // criticalPath walks the dependency graph for the longest chain of durations —
 // the sequence of actions that had to happen one after another. Nothing else in
 // the build can be blamed for the wall clock.
-func criticalPath(actions []graphAction, byID map[int]*graphAction) (time.Duration, []link) {
+func criticalPath(actions []graphAction, byID map[int]*graphAction, ignore ignoreList) (time.Duration, []link) {
 	type memoized struct {
 		total time.Duration
 		next  int
@@ -186,7 +186,9 @@ func criticalPath(actions []graphAction, byID map[int]*graphAction) (time.Durati
 		if !ok {
 			break
 		}
-		if d := actionDuration(a); d > 0 {
+		// The chain itself, and therefore the total, is unaffected by -ignore;
+		// only the rows naming a package are held back.
+		if d := actionDuration(a); d > 0 && !ignore.match(a.Package) {
 			path = append(path, link{pkg: a.Package, mode: a.Mode, dur: d})
 		}
 	}
@@ -196,7 +198,7 @@ func criticalPath(actions []graphAction, byID map[int]*graphAction) (time.Durati
 
 // blastRoots finds the packages whose own sources changed — rebuilt while every
 // dependency came from the cache — and counts what had to be rebuilt after them.
-func blastRoots(actions []graphAction, byID map[int]*graphAction) []blastRoot {
+func blastRoots(actions []graphAction, byID map[int]*graphAction, ignore ignoreList) []blastRoot {
 	dependents := make(map[int][]int, len(actions))
 	for i := range actions {
 		for _, dep := range actions[i].Deps {
@@ -208,7 +210,7 @@ func blastRoots(actions []graphAction, byID map[int]*graphAction) []blastRoot {
 
 	for i := range actions {
 		a := &actions[i]
-		if !a.NeedBuild || a.Package == "" || a.Mode != "build" {
+		if !a.NeedBuild || a.Package == "" || a.Mode != "build" || ignore.match(a.Package) {
 			continue
 		}
 

@@ -154,7 +154,7 @@ func TestIsStdBuild(t *testing.T) {
 func TestStatsResolvesStdlibAfterTheFact(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 
 	st.start(startEvent{id: 1, tool: "asm", pkg: "internal/cpu"})
 	st.end(endEvent{id: 1, dur: 30 * time.Millisecond})
@@ -179,7 +179,7 @@ func TestStatsResolvesStdlibAfterTheFact(t *testing.T) {
 func TestStatsKeepsSlowestSorted(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 	for i, d := range []time.Duration{10, 90, 30, 70, 50} {
 		//nolint:gosec // small loop index
 		id := uint64(i + 1)
@@ -201,7 +201,7 @@ func TestStatsKeepsSlowestSorted(t *testing.T) {
 func TestStatsAbortedActionLeavesRunningList(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 	st.start(startEvent{id: 1, tool: "compile", pkg: "p"})
 	st.end(endEvent{id: 1, aborted: true})
 
@@ -301,7 +301,7 @@ func TestLayoutReservesFixedHeights(t *testing.T) {
 func TestSoloTimeIsOnlyChargedWhenAlone(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 
 	// "alone" runs by itself for a while, then "friend" joins it.
 	st.start(startEvent{id: 1, tool: "compile", pkg: "alone"})
@@ -341,7 +341,7 @@ func TestSoloTimeIsOnlyChargedWhenAlone(t *testing.T) {
 func TestSoloTimeCountsGapsWithNothingRunningAsIdle(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 
 	time.Sleep(120 * time.Millisecond) // the go command loading packages
 	st.start(startEvent{id: 1, tool: "compile", pkg: "p"})
@@ -361,7 +361,7 @@ func TestSoloTimeCountsGapsWithNothingRunningAsIdle(t *testing.T) {
 func TestBlockingIncludesTheActionInFlight(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 	st.start(startEvent{id: 1, tool: "compile", pkg: "still/running"})
 	time.Sleep(150 * time.Millisecond)
 
@@ -416,7 +416,7 @@ func TestScanCompileLinesCountsPackages(t *testing.T) {
 func TestProgressUsesUnionOfPlanAndObserved(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 
 	st.start(startEvent{id: 1, tool: "compile", pkg: "already/done"})
 	st.end(endEvent{id: 1, dur: time.Millisecond})
@@ -442,7 +442,7 @@ func TestProgressUsesUnionOfPlanAndObserved(t *testing.T) {
 func TestTimelineRowsAreFixedAndPacked(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 	for i := range 4 { // four overlapping actions must occupy four lanes
 		//nolint:gosec // small loop index
 		id := uint64(i + 1)
@@ -516,7 +516,7 @@ func TestAssignLanesPacksOverlappingWork(t *testing.T) {
 func TestWriteTraceIsCleanForPerfetto(t *testing.T) {
 	t.Parallel()
 
-	st := newStats(nil, true)
+	st := newStats(nil, true, nil)
 	for i := range 6 {
 		//nolint:gosec // small loop index
 		id := uint64(i + 1)
@@ -681,6 +681,137 @@ func TestParseArgsModes(t *testing.T) {
 			t.Fatalf("no summary at all: %q", got)
 		}
 	})
+}
+
+func TestIgnoreMatching(t *testing.T) {
+	t.Parallel()
+
+	list := parseIgnore([]string{"gitlab.com/tropicalsun/*", "example.com/internal"})
+
+	hidden := []string{
+		"gitlab.com/tropicalsun/foundation/packages/fnd-events/go",
+		"gitlab.com/tropicalsun/anything",
+		"example.com/internal",     // the package the pattern names
+		"example.com/internal/api", // and the tree under it
+	}
+	for _, pkg := range hidden {
+		if !list.match(pkg) {
+			t.Fatalf("%q should be ignored", pkg)
+		}
+	}
+
+	shown := []string{
+		"gitlab.com/other/pkg",
+		"example.com/internalise", // a prefix is not a path boundary
+		"net/http",
+		"",
+	}
+	for _, pkg := range shown {
+		if list.match(pkg) {
+			t.Fatalf("%q should not be ignored", pkg)
+		}
+	}
+
+	// The wildcard spans slashes, which "path".Match would not do.
+	if !globMatch("a/*/d", "a/b/c/d") {
+		t.Fatal("* must cross path separators")
+	}
+	if globMatch("a/*/d", "a/b/c/e") {
+		t.Fatal("suffix must still match")
+	}
+}
+
+func TestIgnoreEnvAndFlagCombine(t *testing.T) {
+	t.Setenv(ignoreEnv, "from.env/*, spaced.env/*")
+
+	list := parseIgnore([]string{"from.flag/*"})
+
+	for _, pkg := range []string{"from.env/x", "spaced.env/x", "from.flag/x"} {
+		if !list.match(pkg) {
+			t.Fatalf("%q should be ignored; flag and environment both apply", pkg)
+		}
+	}
+}
+
+// Ignored packages are still compiled, so they must stay in the totals — a
+// progress bar that dropped them would never reach the end.
+func TestIgnoredPackagesLeaveTheListsButNotTheTotals(t *testing.T) {
+	t.Parallel()
+
+	st := newStats(nil, true, parseIgnore([]string{"secret.com/*"}))
+
+	st.start(startEvent{id: 1, tool: "compile", pkg: "secret.com/private/thing"})
+	st.end(endEvent{id: 1, dur: 900 * time.Millisecond})
+	st.start(startEvent{id: 2, tool: "compile", pkg: "example.com/app"})
+	st.end(endEvent{id: 2, dur: 50 * time.Millisecond})
+
+	sn := st.snapshot()
+
+	if sn.compiled != 2 {
+		t.Fatalf("compiled=%d, want both packages counted", sn.compiled)
+	}
+	if sn.cpu != 950*time.Millisecond {
+		t.Fatalf("cpu=%v, want the ignored package included", sn.cpu)
+	}
+
+	for _, a := range sn.visibleSlow(true, 10) {
+		if a.pkg != "example.com/app" {
+			t.Fatalf("%q leaked into the slowest chart", a.pkg)
+		}
+	}
+	for _, a := range sn.visibleRecent(true, 10) {
+		if a.pkg != "example.com/app" {
+			t.Fatalf("%q leaked into the done list", a.pkg)
+		}
+	}
+	if len(sn.timeline) != 1 || sn.timeline[0].pkg != "example.com/app" {
+		t.Fatalf("timeline carries an ignored package: %+v", sn.timeline)
+	}
+}
+
+func TestIgnoredPackagesLeaveTheRunningListAndCriticalPath(t *testing.T) {
+	t.Parallel()
+
+	st := newStats(nil, true, parseIgnore([]string{"secret.com/*"}))
+	st.start(startEvent{id: 1, tool: "compile", pkg: "secret.com/private/thing"})
+	st.start(startEvent{id: 2, tool: "compile", pkg: "example.com/app"})
+
+	sn := st.snapshot()
+	if len(sn.active) != 1 || sn.active[0].pkg != "example.com/app" {
+		t.Fatalf("running list shows an ignored package: %+v", sn.active)
+	}
+
+	graph := `[
+	 {"ID":1,"Mode":"build","Package":"example.com/app","Deps":[2],"NeedBuild":true,
+	  "TimeReady":"2026-01-01T00:00:01Z","TimeStart":"2026-01-01T00:00:01Z","TimeDone":"2026-01-01T00:00:02Z"},
+	 {"ID":2,"Mode":"build","Package":"secret.com/private/thing","Deps":[],"NeedBuild":true,
+	  "TimeReady":"2026-01-01T00:00:00Z","TimeStart":"2026-01-01T00:00:00Z","TimeDone":"2026-01-01T00:00:01Z"}
+	]`
+
+	path := filepath.Join(t.TempDir(), "graph.json")
+	if err := os.WriteFile(path, []byte(graph), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := loadGraph(path, parseIgnore([]string{"secret.com/*"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The chain is two seconds long whether or not one of its links is named.
+	if g.critical != 2*time.Second {
+		t.Fatalf("critical=%v, want the ignored link still counted", g.critical)
+	}
+	for _, l := range g.path {
+		if l.pkg != "example.com/app" {
+			t.Fatalf("%q leaked into the critical path rows", l.pkg)
+		}
+	}
+	for _, r := range g.roots {
+		if r.pkg != "example.com/app" {
+			t.Fatalf("%q leaked into the rebuilt roots", r.pkg)
+		}
+	}
 }
 
 func stripANSI(s string) string {

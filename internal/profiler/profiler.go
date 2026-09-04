@@ -106,6 +106,13 @@ flags:
                     packages that compiled alone while everything else waited
   -recent N         rows reserved for the "done" list (default 5)
   -hide-std         leave standard library packages out of the lists
+  -ignore PATTERN   keep packages out of the lists, charts, timeline and trace.
+                    "*" spans slashes, so "example.com/org/*" covers a tree; a
+                    pattern without one names a package and everything under it.
+                    Repeatable, or comma separated, or set SHINY_GOGGLES_IGNORE
+                    to keep it off a command line that is being recorded.
+                    Ignored packages are still built and still counted in the
+                    totals — only their names are held back
   -trace FILE       write a trace of the build — one track per parallel worker,
                     one slice per package — and open it at https://ui.perfetto.dev
   -go-trace FILE    the go command's own -debug-trace instead. Note that perfetto

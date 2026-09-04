@@ -28,6 +28,7 @@ type action struct {
 	start  time.Time
 	dur    time.Duration
 	failed bool
+	hidden bool          // matched -ignore: still built and counted, never listed
 	expect time.Duration // typical duration from previous builds, 0 if unknown
 	// solo is the wall clock time this action spent as the only thing in
 	// flight: the build made no other progress while it ran.
@@ -104,12 +105,13 @@ type stats struct {
 	// compile and the ones we have watched it compile — the denominator of the
 	// progress bar. See planPackages for why the union is the exact answer.
 	compileSeen map[string]bool
+	ignore      ignoreList
 	expect      map[string]time.Duration
 	slower      []*action       // finished much slower than the recorded expectation
 	stdPkgs     map[string]bool // import paths the go command marked as standard library
 }
 
-func newStats(expect map[string]time.Duration, keepAll bool) *stats {
+func newStats(expect map[string]time.Duration, keepAll bool, ignore ignoreList) *stats {
 	now := time.Now()
 
 	return &stats{
@@ -121,6 +123,7 @@ func newStats(expect map[string]time.Duration, keepAll bool) *stats {
 		stdPkgs:     make(map[string]bool, 128),
 		compileSeen: make(map[string]bool, 256),
 		keepAll:     keepAll,
+		ignore:      ignore,
 		expect:      expect,
 	}
 }
@@ -181,11 +184,12 @@ func (s *stats) start(ev startEvent) {
 	}
 
 	a := &action{
-		id:    ev.id,
-		tool:  ev.tool,
-		pkg:   ev.pkg,
-		std:   std,
-		start: now,
+		id:     ev.id,
+		tool:   ev.tool,
+		pkg:    ev.pkg,
+		std:    std,
+		start:  now,
+		hidden: s.ignore.match(ev.pkg),
 	}
 	if d, ok := s.expect[ev.pkg]; ok {
 		a.expect = d
@@ -246,18 +250,18 @@ func (s *stats) end(ev endEvent) (string, bool) {
 		s.failed++
 	}
 
-	if a.expect > 250*time.Millisecond && a.dur > a.expect*3/2 {
+	if a.expect > 250*time.Millisecond && a.dur > a.expect*3/2 && !a.hidden {
 		s.slower = append(s.slower, a)
 	}
 
 	s.pushRecent(a)
 	s.pushSlow(a)
 
-	if a.blocking() {
+	if a.blocking() && !a.hidden {
 		s.blocking = insertSorted(s.blocking, a, keptBlocking, func(x *action) time.Duration { return x.solo })
 	}
 
-	if a.funcs > 0 {
+	if a.funcs > 0 && !a.hidden {
 		// The build's own average is the only sensible yardstick for "unusually
 		// many functions for its size" — the absolute ratio means nothing.
 		s.totalFuncs += a.funcs
@@ -268,7 +272,7 @@ func (s *stats) end(ev endEvent) (string, bool) {
 		})
 	}
 
-	if s.keepAll && len(s.timeline) < keptTimeline {
+	if s.keepAll && !a.hidden && len(s.timeline) < keptTimeline {
 		s.timeline = append(s.timeline, a)
 	}
 
@@ -276,6 +280,10 @@ func (s *stats) end(ev endEvent) (string, bool) {
 }
 
 func (s *stats) pushRecent(a *action) {
+	if a.hidden {
+		return
+	}
+
 	s.recent = append(s.recent, a)
 	if len(s.recent) > keptRecent {
 		s.recent = s.recent[len(s.recent)-keptRecent:]
@@ -284,6 +292,10 @@ func (s *stats) pushRecent(a *action) {
 
 // pushSlow keeps s.slow sorted by duration, longest first.
 func (s *stats) pushSlow(a *action) {
+	if a.hidden {
+		return
+	}
+
 	s.slow = insertSorted(s.slow, a, keptSlow, func(x *action) time.Duration { return x.dur })
 }
 
@@ -473,6 +485,10 @@ func (s *stats) snapshot() snap {
 	}
 
 	for _, a := range s.active {
+		if a.hidden {
+			continue
+		}
+
 		copied := *a
 		copied.std = copied.std || s.stdPkgs[copied.pkg]
 		sn.active = append(sn.active, copied)
